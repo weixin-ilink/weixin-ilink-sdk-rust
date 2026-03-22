@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::cdn::aes_ecb::{decrypt_aes_ecb, parse_aes_key};
 use crate::client::ILinkClient;
 use crate::error::{Error, Result};
-use crate::http::HttpClient;
+use crate::http_client::HttpClient;
 
 /// Download and AES-128-ECB decrypt a CDN media file.
 ///

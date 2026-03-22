@@ -24,10 +24,11 @@ pub struct AccountData {
 /// Layout:
 /// ```text
 /// base_dir/
-///   accounts.json          # ["account-id-1", "account-id-2"]
 ///   accounts/
-///     account-id-1.json    # AccountData
-///     account-id-2.json
+///     abc@im.bot/
+///       credential.json    # AccountData
+///       sync_buf.txt       # message cursor
+///       downloads/         # media files
 /// ```
 pub struct CredentialStore {
     base_dir: PathBuf,
@@ -44,28 +45,49 @@ impl CredentialStore {
         self.base_dir.join("accounts")
     }
 
-    fn index_path(&self) -> PathBuf {
-        self.base_dir.join("accounts.json")
+    /// Resolve the directory for a specific account.
+    pub fn account_dir(&self, id: &str) -> PathBuf {
+        self.accounts_dir().join(id)
     }
 
-    fn account_path(&self, id: &str) -> PathBuf {
-        self.accounts_dir().join(format!("{id}.json"))
+    fn credential_path(&self, id: &str) -> PathBuf {
+        self.account_dir(id).join("credential.json")
     }
 
-    /// List all registered account IDs.
+    /// Resolve the sync_buf file path for an account.
+    pub fn sync_buf_path(&self, id: &str) -> PathBuf {
+        self.account_dir(id).join("sync_buf.txt")
+    }
+
+    /// Resolve the downloads directory for an account.
+    pub fn downloads_dir(&self, id: &str) -> PathBuf {
+        self.account_dir(id).join("downloads")
+    }
+
+    /// List all account IDs (scans subdirectories under `accounts/`).
     pub fn list_accounts(&self) -> Result<Vec<String>> {
-        let path = self.index_path();
-        if !path.exists() {
+        let dir = self.accounts_dir();
+        if !dir.exists() {
             return Ok(Vec::new());
         }
-        let raw = fs::read_to_string(&path)?;
-        let ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    // Only include dirs that have a credential.json
+                    if self.credential_path(name).exists() {
+                        ids.push(name.to_string());
+                    }
+                }
+            }
+        }
         Ok(ids)
     }
 
     /// Load account data by ID.
     pub fn load_account(&self, id: &str) -> Result<Option<AccountData>> {
-        let path = self.account_path(id);
+        let path = self.credential_path(id);
         if !path.exists() {
             return Ok(None);
         }
@@ -74,75 +96,37 @@ impl CredentialStore {
         Ok(Some(data))
     }
 
-    /// Save account data (merges with existing).
+    /// Save account data.
     pub fn save_account(&self, id: &str, data: &AccountData) -> Result<()> {
-        let dir = self.accounts_dir();
+        let dir = self.account_dir(id);
         fs::create_dir_all(&dir)?;
 
-        let path = self.account_path(id);
+        let path = self.credential_path(id);
         let json = serde_json::to_string_pretty(data)?;
         fs::write(&path, &json)?;
 
-        // Best-effort: restrict file permissions on unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         }
 
-        // Register in index.
-        self.register_account_id(id)?;
         Ok(())
     }
 
-    /// Remove account data.
+    /// Remove an account and all its data.
     pub fn remove_account(&self, id: &str) -> Result<()> {
-        let path = self.account_path(id);
-        if path.exists() {
-            fs::remove_file(&path)?;
+        let dir = self.account_dir(id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
         }
-
-        // Remove from index.
-        let mut ids = self.list_accounts()?;
-        ids.retain(|i| i != id);
-        self.write_index(&ids)?;
         Ok(())
     }
-
-    fn register_account_id(&self, id: &str) -> Result<()> {
-        let mut ids = self.list_accounts()?;
-        if ids.iter().any(|i| i == id) {
-            return Ok(());
-        }
-        ids.push(id.to_string());
-        self.write_index(&ids)
-    }
-
-    fn write_index(&self, ids: &[String]) -> Result<()> {
-        fs::create_dir_all(&self.base_dir)?;
-        let json = serde_json::to_string_pretty(ids)?;
-        fs::write(self.index_path(), json)?;
-        Ok(())
-    }
-}
-
-/// Normalize an account ID to a filesystem-safe string.
-///
-/// e.g. `"b0f5860fdecb@im.bot"` → `"b0f5860fdecb-im-bot"`
-pub fn normalize_account_id(raw: &str) -> String {
-    raw.replace('@', "-").replace('.', "-")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_ids() {
-        assert_eq!(normalize_account_id("abc@im.bot"), "abc-im-bot");
-        assert_eq!(normalize_account_id("abc@im.wechat"), "abc-im-wechat");
-        assert_eq!(normalize_account_id("plain-id"), "plain-id");
-    }
 
     #[test]
     fn store_roundtrip() {
@@ -157,16 +141,24 @@ mod tests {
             base_url: Some("https://example.com".into()),
             user_id: Some("user1".into()),
         };
-        store.save_account("test-id", &data).unwrap();
+        store.save_account("abc@im.bot", &data).unwrap();
 
         let ids = store.list_accounts().unwrap();
-        assert_eq!(ids, vec!["test-id"]);
+        assert_eq!(ids, vec!["abc@im.bot"]);
 
-        let loaded = store.load_account("test-id").unwrap().unwrap();
+        // Verify directory structure
+        assert!(store.account_dir("abc@im.bot").exists());
+        assert!(store.credential_path("abc@im.bot").exists());
+        assert_eq!(
+            store.sync_buf_path("abc@im.bot"),
+            dir.path().join("accounts/abc@im.bot/sync_buf.txt")
+        );
+
+        let loaded = store.load_account("abc@im.bot").unwrap().unwrap();
         assert_eq!(loaded.token.as_deref(), Some("tok123"));
 
-        store.remove_account("test-id").unwrap();
+        store.remove_account("abc@im.bot").unwrap();
         assert!(store.list_accounts().unwrap().is_empty());
-        assert!(store.load_account("test-id").unwrap().is_none());
+        assert!(!store.account_dir("abc@im.bot").exists());
     }
 }

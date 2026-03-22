@@ -6,7 +6,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::cdn::upload::{upload_file, upload_image, upload_video, UploadedFile};
 use crate::client::ILinkClient;
 use crate::error::{Error, Result};
-use crate::http::HttpClient;
+use crate::http_client::HttpClient;
 use crate::types::*;
 use crate::util::media_type::mime_from_path;
 
@@ -19,7 +19,7 @@ fn build_text_message(to: &str, text: &str, context_token: &str) -> SendMessageR
         None
     } else {
         Some(vec![MessageItem {
-            item_type: Some(MessageItemType::Text.into()),
+            item_type: Some(MessageItemType::Text),
             text_item: Some(TextItem {
                 text: Some(text.to_string()),
             }),
@@ -32,8 +32,8 @@ fn build_text_message(to: &str, text: &str, context_token: &str) -> SendMessageR
             from_user_id: Some(String::new()),
             to_user_id: Some(to.to_string()),
             client_id: Some(generate_client_id()),
-            message_type: Some(MessageType::Bot.into()),
-            message_state: Some(MessageState::Finish.into()),
+            message_type: Some(MessageType::Bot),
+            message_state: Some(MessageState::Finish),
             item_list,
             context_token: Some(context_token.to_string()),
             ..Default::default()
@@ -52,8 +52,8 @@ fn build_media_item_request(
             from_user_id: Some(String::new()),
             to_user_id: Some(to.to_string()),
             client_id: Some(generate_client_id()),
-            message_type: Some(MessageType::Bot.into()),
-            message_state: Some(MessageState::Finish.into()),
+            message_type: Some(MessageType::Bot),
+            message_state: Some(MessageState::Finish),
             item_list: Some(vec![item]),
             context_token: Some(context_token.to_string()),
             ..Default::default()
@@ -64,7 +64,7 @@ fn build_media_item_request(
 
 fn image_message_item(uploaded: &UploadedFile) -> MessageItem {
     MessageItem {
-        item_type: Some(MessageItemType::Image.into()),
+        item_type: Some(MessageItemType::Image),
         image_item: Some(ImageItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
@@ -80,7 +80,7 @@ fn image_message_item(uploaded: &UploadedFile) -> MessageItem {
 
 fn video_message_item(uploaded: &UploadedFile) -> MessageItem {
     MessageItem {
-        item_type: Some(MessageItemType::Video.into()),
+        item_type: Some(MessageItemType::Video),
         video_item: Some(VideoItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
@@ -96,7 +96,7 @@ fn video_message_item(uploaded: &UploadedFile) -> MessageItem {
 
 fn file_message_item(uploaded: &UploadedFile, file_name: &str) -> MessageItem {
     MessageItem {
-        item_type: Some(MessageItemType::File.into()),
+        item_type: Some(MessageItemType::File),
         file_item: Some(FileItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
@@ -123,7 +123,7 @@ pub async fn send_text<H: HttpClient>(
     }
     let req = build_text_message(to, text, context_token);
     let msg_id = req.msg.client_id.clone().unwrap_or_default();
-    client.send_message(&req).await?;
+    client.send_message(req).await?;
     Ok(msg_id)
 }
 
@@ -144,12 +144,12 @@ async fn send_with_media<H: HttpClient>(
 
     if !text.is_empty() {
         let text_req = build_text_message(to, text, context_token);
-        client.send_message(&text_req).await?;
+        client.send_message(text_req).await?;
     }
 
     let req = build_media_item_request(to, media_item, context_token);
     let msg_id = req.msg.client_id.clone().unwrap_or_default();
-    client.send_message(&req).await?;
+    client.send_message(req).await?;
     Ok(msg_id)
 }
 

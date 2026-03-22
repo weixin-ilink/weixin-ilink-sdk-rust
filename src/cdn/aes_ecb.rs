@@ -32,11 +32,14 @@ pub fn aes_ecb_padded_size(plaintext_size: usize) -> usize {
 /// - base64(32-char hex string) — file/voice/video
 pub fn parse_aes_key(aes_key_base64: &str) -> Result<[u8; 16]> {
     use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 
     let decoded = STANDARD
         .decode(aes_key_base64)
-        .map_err(|e| Error::Aes(format!("base64 decode failed: {e}")))?;
+        .or_else(|_| STANDARD_NO_PAD.decode(aes_key_base64))
+        .or_else(|_| URL_SAFE.decode(aes_key_base64))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(aes_key_base64))
+        .map_err(|e| Error::Aes(format!("base64 decode failed (tried all variants): {e}")))?;
 
     if decoded.len() == 16 {
         let mut key = [0u8; 16];

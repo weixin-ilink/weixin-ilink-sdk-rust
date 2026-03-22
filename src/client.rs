@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use parking_lot::RwLock;
 use std::time::Duration;
 
 use base64::Engine;
@@ -6,7 +9,7 @@ use rand::RngExt;
 use url::Url;
 
 use crate::error::{Error, HttpError, Result, SESSION_EXPIRED_ERRCODE};
-use crate::http::HttpClient;
+use crate::http_client::HttpClient;
 use crate::types::*;
 
 pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -23,9 +26,21 @@ pub struct ILinkClient<H: HttpClient = reqwest::Client> {
     token: Option<String>,
     route_tag: Option<String>,
     channel_version: String,
+    /// Per-user context token cache (user_id → context_token).
+    context_tokens: RwLock<HashMap<String, String>>,
 }
 
+// ── Builder ─────────────────────────────────────────────────────────────────
+
 /// Builder for `ILinkClient`.
+///
+/// ```ignore
+/// // Already have a token:
+/// let client = ILinkClient::builder().token("xxx").build();
+///
+/// // QR login → ready-to-use client:
+/// let client = ILinkClient::builder().login(&TerminalLoginHandler).await?;
+/// ```
 pub struct ILinkClientBuilder<H: HttpClient = reqwest::Client> {
     http: Option<H>,
     base_url: Option<String>,
@@ -80,36 +95,123 @@ impl<H: HttpClient> ILinkClientBuilder<H> {
     }
 }
 
+// ── Build / Login for default reqwest backend ───────────────────────────────
+
 impl ILinkClientBuilder<reqwest::Client> {
+    /// Build a client with the default reqwest HTTP backend.
     pub fn build(self) -> ILinkClient<reqwest::Client> {
-        let http = self.http.unwrap_or_else(crate::http::default_http_client);
-        ILinkClient::from_builder(self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version, http)
+        let http = self.http.unwrap_or_else(crate::http_client::default_http_client);
+        ILinkClient::from_parts(http, self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version)
+    }
+
+    /// QR login and return a ready-to-use client.
+    pub async fn login(
+        self,
+        handler: &dyn crate::auth::LoginHandler,
+    ) -> Result<ILinkClient<reqwest::Client>> {
+        let http = self.http.unwrap_or_else(crate::http_client::default_http_client);
+        do_login(http, self.base_url, self.cdn_base_url, self.route_tag, self.channel_version, handler).await
+    }
+
+    /// QR login, persist credentials, and return a ready-to-use client.
+    pub async fn login_and_save(
+        self,
+        handler: &dyn crate::auth::LoginHandler,
+        store: &crate::auth::CredentialStore,
+    ) -> Result<ILinkClient<reqwest::Client>> {
+        let http = self.http.unwrap_or_else(crate::http_client::default_http_client);
+        do_login_and_save(http, self.base_url, self.cdn_base_url, self.route_tag, self.channel_version, handler, store).await
     }
 }
 
+// ── Build / Login for custom HTTP backend ───────────────────────────────────
+
 impl<H: HttpClient> ILinkClientBuilder<H> {
+    /// Build with a custom HTTP backend that implements `Default`.
     pub fn build_with(self) -> ILinkClient<H>
     where
         H: Default,
     {
         let http = self.http.unwrap_or_default();
-        ILinkClient::from_builder(self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version, http)
+        ILinkClient::from_parts(http, self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version)
     }
 
-    pub fn build_with_http(self) -> std::result::Result<ILinkClient<H>, &'static str> {
-        let http = self.http.ok_or("http_client is required for custom HttpClient")?;
-        Ok(ILinkClient::from_builder(self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version, http))
+    /// Build with a custom HTTP backend (must have been set via `http_client`).
+    pub fn build_with_http(self) -> Result<ILinkClient<H>> {
+        let http = self.http.ok_or(Error::Other("http_client is required for custom HttpClient".into()))?;
+        Ok(ILinkClient::from_parts(http, self.base_url, self.cdn_base_url, self.token, self.route_tag, self.channel_version))
+    }
+
+    /// QR login with a custom HTTP backend (must have been set via `http_client`).
+    pub async fn login_with_http(
+        self,
+        handler: &dyn crate::auth::LoginHandler,
+    ) -> Result<ILinkClient<H>> {
+        let http = self.http.ok_or(Error::Other("http_client is required".into()))?;
+        do_login(http, self.base_url, self.cdn_base_url, self.route_tag, self.channel_version, handler).await
     }
 }
 
+// ── Login implementation ────────────────────────────────────────────────────
+
+async fn do_login<H: HttpClient>(
+    http: H,
+    base_url: Option<String>,
+    cdn_base_url: Option<String>,
+    route_tag: Option<String>,
+    channel_version: Option<String>,
+    handler: &dyn crate::auth::LoginHandler,
+) -> Result<ILinkClient<H>> {
+    let base = base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+
+    let result = crate::auth::QrLoginSession::start(&http, base, route_tag.as_deref())
+        .await?
+        .wait_for_login_with(handler)
+        .await?;
+
+    // Server may return a different base_url for this account.
+    let final_base = result.base_url.as_ref()
+        .filter(|u| !u.is_empty())
+        .cloned()
+        .or(base_url);
+
+    Ok(ILinkClient::from_parts(http, final_base, cdn_base_url, Some(result.bot_token), route_tag, channel_version))
+}
+
+async fn do_login_and_save<H: HttpClient>(
+    http: H,
+    base_url: Option<String>,
+    cdn_base_url: Option<String>,
+    route_tag: Option<String>,
+    channel_version: Option<String>,
+    handler: &dyn crate::auth::LoginHandler,
+    store: &crate::auth::CredentialStore,
+) -> Result<ILinkClient<H>> {
+    let base = base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
+
+    let result = crate::auth::QrLoginSession::start(&http, base, route_tag.as_deref())
+        .await?
+        .wait_and_save_with(handler, store)
+        .await?;
+
+    let final_base = result.base_url.as_ref()
+        .filter(|u| !u.is_empty())
+        .cloned()
+        .or(base_url);
+
+    Ok(ILinkClient::from_parts(http, final_base, cdn_base_url, Some(result.bot_token), route_tag, channel_version))
+}
+
+// ── ILinkClient ─────────────────────────────────────────────────────────────
+
 impl<H: HttpClient> ILinkClient<H> {
-    fn from_builder(
+    fn from_parts(
+        http: H,
         base_url: Option<String>,
         cdn_base_url: Option<String>,
         token: Option<String>,
         route_tag: Option<String>,
         channel_version: Option<String>,
-        http: H,
     ) -> Self {
         let base_url = base_url
             .and_then(|u| Url::parse(&u).ok())
@@ -124,6 +226,7 @@ impl<H: HttpClient> ILinkClient<H> {
             token,
             route_tag,
             channel_version: channel_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+            context_tokens: RwLock::new(HashMap::new()),
         }
     }
 
@@ -147,8 +250,51 @@ impl<H: HttpClient> ILinkClient<H> {
         self.token.as_deref()
     }
 
-    pub fn set_token(&mut self, token: impl Into<String>) {
-        self.token = Some(token.into());
+    // ── Context token cache ─────────────────────────────────────────────
+
+    /// Cache a context_token for a user (called automatically by `UpdatesStream`).
+    pub fn set_context_token(&self, user_id: &str, context_token: &str) {
+        self.context_tokens
+            .write()
+            .insert(user_id.to_string(), context_token.to_string());
+    }
+
+    /// Get the cached context_token for a user.
+    pub fn get_context_token(&self, user_id: &str) -> Option<String> {
+        self.context_tokens.read().get(user_id).cloned()
+    }
+
+    /// Send a proactive text message using the cached context_token.
+    pub async fn push_text(&self, to: &str, text: &str) -> Result<String> {
+        let ctx = self.get_context_token(to).ok_or(Error::MissingContextToken)?;
+        crate::messaging::send::send_text(self, to, text, &ctx).await
+    }
+
+    // ── Convenience send methods ────────────────────────────────────────
+
+    /// Send a plain text message.
+    pub async fn send_text(&self, to: &str, text: &str, context_token: &str) -> Result<String> {
+        crate::messaging::send::send_text(self, to, text, context_token).await
+    }
+
+    /// Send an image (upload + send).
+    pub async fn send_image(&self, to: &str, path: &std::path::Path, text: &str, context_token: &str) -> Result<String> {
+        crate::messaging::send::send_image(self, to, path, text, context_token).await
+    }
+
+    /// Send a video (upload + send).
+    pub async fn send_video(&self, to: &str, path: &std::path::Path, text: &str, context_token: &str) -> Result<String> {
+        crate::messaging::send::send_video(self, to, path, text, context_token).await
+    }
+
+    /// Send a file attachment (upload + send).
+    pub async fn send_file(&self, to: &str, path: &std::path::Path, text: &str, context_token: &str) -> Result<String> {
+        crate::messaging::send::send_file(self, to, path, text, context_token).await
+    }
+
+    /// Send media, auto-detecting type from extension.
+    pub async fn send_media(&self, to: &str, path: &std::path::Path, text: &str, context_token: &str) -> Result<String> {
+        crate::messaging::send::send_media(self, to, path, text, context_token).await
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
@@ -164,13 +310,18 @@ impl<H: HttpClient> ILinkClient<H> {
         BASE64.encode(uint32.to_string().as_bytes())
     }
 
+    fn base_url_str(&self) -> &str {
+        self.base_url.as_str().trim_end_matches('/')
+    }
+
     fn build_request(
         &self,
         endpoint: &str,
         body: Vec<u8>,
-        timeout: Duration,
     ) -> http::Request<Vec<u8>> {
-        let url = format!("{}{}", self.base_url.as_str().trim_end_matches('/'), if endpoint.starts_with('/') { endpoint.to_string() } else { format!("/{endpoint}") });
+        let base = self.base_url_str();
+        let sep = if endpoint.starts_with('/') { "" } else { "/" };
+        let url = format!("{base}{sep}{endpoint}");
 
         let mut builder = http::Request::builder()
             .method(http::Method::POST)
@@ -178,8 +329,7 @@ impl<H: HttpClient> ILinkClient<H> {
             .header("Content-Type", "application/json")
             .header("Content-Length", body.len().to_string())
             .header("AuthorizationType", "ilink_bot_token")
-            .header("X-WECHAT-UIN", Self::random_wechat_uin())
-            .header("X-Timeout-Ms", timeout.as_millis().to_string());
+            .header("X-WECHAT-UIN", Self::random_wechat_uin());
 
         if let Some(token) = &self.token {
             builder = builder.header("Authorization", format!("Bearer {token}"));
@@ -195,11 +345,10 @@ impl<H: HttpClient> ILinkClient<H> {
         &self,
         endpoint: &str,
         req: &Req,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<Resp> {
         let body = serde_json::to_vec(req)?;
-        let request = self.build_request(endpoint, body, timeout);
-
+        let request = self.build_request(endpoint, body);
         tracing::debug!(endpoint, "API POST");
 
         let response = self.http.execute(request).await.map_err(Error::Http)?;
@@ -214,16 +363,33 @@ impl<H: HttpClient> ILinkClient<H> {
             }));
         }
 
-        let resp: Resp = serde_json::from_slice(&body)?;
-        Ok(resp)
+        // Check for API-level errors (HTTP 200 but ret != 0).
+        #[derive(serde::Deserialize)]
+        struct ApiErrorCheck {
+            #[serde(default)]
+            ret: Option<i32>,
+            #[serde(default)]
+            errcode: Option<i32>,
+            #[serde(default)]
+            errmsg: Option<String>,
+        }
+        if let Ok(check) = serde_json::from_slice::<ApiErrorCheck>(&body) {
+            let ret = check.ret.unwrap_or(0);
+            if ret != 0 {
+                return Err(Error::Api {
+                    ret,
+                    errcode: check.errcode,
+                    message: check.errmsg.unwrap_or_default(),
+                });
+            }
+        }
+
+        Ok(serde_json::from_slice(&body)?)
     }
 
     // ── Public API ──────────────────────────────────────────────────────
 
     /// Long-poll for new messages.
-    ///
-    /// Returns an empty response (ret=0, no msgs) on client timeout, which is
-    /// normal for long-poll — the caller should simply retry.
     pub async fn get_updates(
         &self,
         get_updates_buf: &str,
@@ -237,7 +403,7 @@ impl<H: HttpClient> ILinkClient<H> {
 
         match self.api_post("ilink/bot/getupdates", &req, timeout).await {
             Ok(resp) => Ok(resp),
-            Err(Error::Http(HttpError::Timeout(_))) => {
+            Err(Error::Http(HttpError::Timeout)) => {
                 tracing::debug!("getUpdates client timeout, returning empty response");
                 Ok(GetUpdatesResponse {
                     ret: Some(0),
@@ -252,10 +418,13 @@ impl<H: HttpClient> ILinkClient<H> {
         }
     }
 
-    /// Send a message downstream.
-    pub async fn send_message(&self, req: &SendMessageRequest) -> Result<()> {
+    /// Send a message downstream (auto-injects `base_info`).
+    pub async fn send_message(&self, mut req: SendMessageRequest) -> Result<()> {
+        if req.base_info.is_none() {
+            req.base_info = Some(self.base_info());
+        }
         let _: serde_json::Value = self
-            .api_post("ilink/bot/sendmessage", req, DEFAULT_API_TIMEOUT)
+            .api_post("ilink/bot/sendmessage", &req, DEFAULT_API_TIMEOUT)
             .await?;
         Ok(())
     }
@@ -291,78 +460,13 @@ impl<H: HttpClient> ILinkClient<H> {
         let req = SendTypingRequest {
             ilink_user_id: user_id.to_string(),
             typing_ticket: typing_ticket.to_string(),
-            status: status.into(),
+            status,
             base_info: Some(self.base_info()),
         };
         let _: serde_json::Value = self
             .api_post("ilink/bot/sendtyping", &req, DEFAULT_CONFIG_TIMEOUT)
             .await?;
         Ok(())
-    }
-
-    // ── QR Login endpoints ──────────────────────────────────────────────
-
-    /// Fetch a QR code for bot login.
-    pub async fn get_bot_qrcode(&self, bot_type: &str) -> Result<QrCodeResponse> {
-        let url = format!(
-            "{}/ilink/bot/get_bot_qrcode?bot_type={}",
-            self.base_url.as_str().trim_end_matches('/'),
-            urlencoding::encode(bot_type)
-        );
-
-        let mut builder = http::Request::builder()
-            .method(http::Method::GET)
-            .uri(&url);
-        if let Some(tag) = &self.route_tag {
-            builder = builder.header("SKRouteTag", tag.as_str());
-        }
-        let request = builder.body(Vec::new()).expect("failed to build request");
-
-        let response = self.http.execute(request).await.map_err(Error::Http)?;
-        let status = response.status();
-        let body = response.into_body();
-
-        if !status.is_success() {
-            let text = String::from_utf8_lossy(&body).to_string();
-            return Err(Error::Http(HttpError::Status {
-                status: status.as_u16(),
-                body: text,
-            }));
-        }
-
-        Ok(serde_json::from_slice(&body)?)
-    }
-
-    /// Poll QR code scan status (long-poll).
-    pub async fn get_qrcode_status(&self, qrcode: &str) -> Result<QrStatusResponse> {
-        let url = format!(
-            "{}/ilink/bot/get_qrcode_status?qrcode={}",
-            self.base_url.as_str().trim_end_matches('/'),
-            urlencoding::encode(qrcode)
-        );
-
-        let mut builder = http::Request::builder()
-            .method(http::Method::GET)
-            .uri(&url)
-            .header("iLink-App-ClientVersion", "1");
-        if let Some(tag) = &self.route_tag {
-            builder = builder.header("SKRouteTag", tag.as_str());
-        }
-        let request = builder.body(Vec::new()).expect("failed to build request");
-
-        let response = self.http.execute(request).await.map_err(Error::Http)?;
-        let status = response.status();
-        let body = response.into_body();
-
-        if !status.is_success() {
-            let text = String::from_utf8_lossy(&body).to_string();
-            return Err(Error::Http(HttpError::Status {
-                status: status.as_u16(),
-                body: text,
-            }));
-        }
-
-        Ok(serde_json::from_slice(&body)?)
     }
 
     // ── CDN raw operations ──────────────────────────────────────────────
@@ -372,7 +476,7 @@ impl<H: HttpClient> ILinkClient<H> {
         &self,
         upload_param: &str,
         filekey: &str,
-        body: Vec<u8>,
+        body: &[u8],
     ) -> Result<String> {
         let url = format!(
             "{}/upload?encrypted_query_param={}&filekey={}",
@@ -385,7 +489,7 @@ impl<H: HttpClient> ILinkClient<H> {
             .method(http::Method::POST)
             .uri(&url)
             .header("Content-Type", "application/octet-stream")
-            .body(body)
+            .body(body.to_vec())
             .expect("failed to build CDN upload request");
 
         let response = self.http.execute(request).await.map_err(Error::Http)?;
@@ -398,17 +502,21 @@ impl<H: HttpClient> ILinkClient<H> {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown error")
                 .to_string();
-            return Err(Error::Cdn(format!("CDN upload failed {status}: {err_msg}")));
+            return Err(Error::Cdn {
+                message: format!("CDN upload failed {status}: {err_msg}"),
+                status_code: Some(status.as_u16()),
+            });
         }
 
-        let download_param = response
+        response
             .headers()
             .get("x-encrypted-param")
             .and_then(|v| v.to_str().ok())
             .map(String::from)
-            .ok_or_else(|| Error::Cdn("missing x-encrypted-param in CDN response".into()))?;
-
-        Ok(download_param)
+            .ok_or_else(|| Error::Cdn {
+                message: "missing x-encrypted-param in CDN response".into(),
+                status_code: None,
+            })
     }
 
     /// Download raw bytes from the CDN.
@@ -430,7 +538,10 @@ impl<H: HttpClient> ILinkClient<H> {
 
         if !status.is_success() {
             let text = String::from_utf8_lossy(response.body()).to_string();
-            return Err(Error::Cdn(format!("CDN download {status}: {text}")));
+            return Err(Error::Cdn {
+                message: format!("CDN download {status}: {text}"),
+                status_code: Some(status.as_u16()),
+            });
         }
 
         Ok(response.into_body())

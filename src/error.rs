@@ -4,6 +4,7 @@ use thiserror::Error;
 pub const SESSION_EXPIRED_ERRCODE: i32 = -14;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("HTTP error: {0}")]
     Http(#[from] HttpError),
@@ -18,8 +19,12 @@ pub enum Error {
     #[error("session expired (errcode {SESSION_EXPIRED_ERRCODE})")]
     SessionExpired,
 
-    #[error("CDN error: {0}")]
-    Cdn(String),
+    #[error("CDN error: {message}")]
+    Cdn {
+        message: String,
+        /// HTTP status code from CDN, if available.
+        status_code: Option<u16>,
+    },
 
     #[error("AES error: {0}")]
     Aes(String),
@@ -47,6 +52,7 @@ pub enum Error {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HttpError {
     #[error("request failed: {0}")]
     Request(String),
@@ -54,11 +60,18 @@ pub enum HttpError {
     #[error("HTTP {status}: {body}")]
     Status { status: u16, body: String },
 
-    #[error("timeout after {0:?}")]
-    Timeout(std::time::Duration),
+    #[error("request timed out")]
+    Timeout,
 
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// Returns true if this is a CDN client error (4xx).
+    pub fn is_cdn_4xx_error(&self) -> bool {
+        matches!(self, Error::Cdn { status_code: Some(s), .. } if (400..500).contains(s))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

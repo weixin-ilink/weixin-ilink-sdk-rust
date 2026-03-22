@@ -25,16 +25,17 @@ tracing = "0.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 qrcode = "0.14"
-console = "0.16"
 hex = "0.4"
 urlencoding = "2"
-
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0.102"
+parking_lot = "0.12"
+silk-codec = "0.1.0"
+libsql = "0.9.30"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
 
 [[example]]
 name = "echo_bot"

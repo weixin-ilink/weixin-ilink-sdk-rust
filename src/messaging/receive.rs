@@ -6,7 +6,7 @@ use tokio_stream::Stream;
 
 use crate::client::{ILinkClient, is_api_error, is_session_expired};
 use crate::error::Result;
-use crate::http::HttpClient;
+use crate::http_client::HttpClient;
 use crate::types::{GetUpdatesResponse, Message};
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -34,6 +34,7 @@ impl Default for UpdatesStreamOptions {
 
 /// An event from the updates stream.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UpdateEvent {
     /// A new inbound message.
     Message(Message),
@@ -43,6 +44,16 @@ pub enum UpdateEvent {
     SessionExpired,
 }
 
+type PollFuture = Pin<Box<dyn std::future::Future<Output = Result<GetUpdatesResponse>> + Send>>;
+
+enum StreamState {
+    Idle,
+    Polling(PollFuture),
+    Sleeping(Pin<Box<tokio::time::Sleep>>),
+    #[allow(dead_code)]
+    Done,
+}
+
 /// A stream of inbound messages from `getUpdates` long-poll.
 ///
 /// Handles:
@@ -50,29 +61,14 @@ pub enum UpdateEvent {
 /// - Error backoff (3 consecutive failures → 30s pause)
 /// - Session expired pause (1 hour)
 /// - Server-suggested poll timeout
+/// - Auto-caching context tokens for `push_text`
 pub struct UpdatesStream<H: HttpClient> {
     client: std::sync::Arc<ILinkClient<H>>,
     buf: String,
     poll_timeout: Option<Duration>,
-    /// Buffered messages from the latest response.
     pending: Vec<Message>,
-    /// Current state machine future.
-    state: StreamState<H>,
+    state: StreamState,
     consecutive_failures: u32,
-}
-
-enum StreamState<H: HttpClient> {
-    /// Idle, ready to start a new poll.
-    Idle,
-    /// Waiting for getUpdates response.
-    Polling(Pin<Box<dyn std::future::Future<Output = Result<GetUpdatesResponse>> + Send>>),
-    /// Sleeping before retry.
-    Sleeping(Pin<Box<tokio::time::Sleep>>),
-    /// Terminal state.
-    #[allow(dead_code)]
-    Done,
-    /// Placeholder during state transitions.
-    _Phantom(std::marker::PhantomData<H>),
 }
 
 impl<H: HttpClient> UpdatesStream<H> {
@@ -93,13 +89,15 @@ impl<H: HttpClient> UpdatesStream<H> {
     }
 }
 
-impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
+// UpdatesStream is Unpin because all fields are either Unpin or behind Box/Arc.
+impl<H: HttpClient> Unpin for UpdatesStream<H> {}
+
+impl<H: HttpClient> Stream for UpdatesStream<H> {
     type Item = Result<UpdateEvent>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Drain buffered messages first.
         if let Some(msg) = this.pending.pop() {
             return Poll::Ready(Some(Ok(UpdateEvent::Message(msg))));
         }
@@ -112,7 +110,7 @@ impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
                     let client = this.client.clone();
                     let buf = this.buf.clone();
                     let timeout = this.poll_timeout;
-                    let fut = Box::pin(async move {
+                    let fut: PollFuture = Box::pin(async move {
                         client.get_updates(&buf, timeout).await
                     });
                     this.state = StreamState::Polling(fut);
@@ -167,14 +165,12 @@ impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
 
                             this.consecutive_failures = 0;
 
-                            // Update poll timeout if server suggests one.
                             if let Some(t) = resp.longpolling_timeout_ms {
                                 if t > 0 {
                                     this.poll_timeout = Some(Duration::from_millis(t));
                                 }
                             }
 
-                            // Update buf.
                             let buf_updated =
                                 if let Some(new_buf) = &resp.get_updates_buf {
                                     if !new_buf.is_empty() && *new_buf != this.buf {
@@ -187,8 +183,16 @@ impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
                                     false
                                 };
 
-                            // Buffer messages (reverse so pop gives first).
                             if let Some(msgs) = resp.msgs {
+                                for msg in &msgs {
+                                    if let (Some(from), Some(ctx)) =
+                                        (&msg.from_user_id, &msg.context_token)
+                                    {
+                                        if !from.is_empty() && !ctx.is_empty() {
+                                            this.client.set_context_token(from, ctx);
+                                        }
+                                    }
+                                }
                                 this.pending = msgs;
                                 this.pending.reverse();
                             }
@@ -201,12 +205,9 @@ impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
                                 ))));
                             }
 
-                            // If we have messages, return the first one.
                             if let Some(msg) = this.pending.pop() {
                                 return Poll::Ready(Some(Ok(UpdateEvent::Message(msg))));
                             }
-
-                            // Empty poll, loop to start another.
                         }
                     }
                 }
@@ -219,8 +220,6 @@ impl<H: HttpClient + Unpin> Stream for UpdatesStream<H> {
                         }
                     }
                 }
-
-                StreamState::_Phantom(_) => unreachable!(),
             }
         }
     }

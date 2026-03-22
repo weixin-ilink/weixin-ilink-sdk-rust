@@ -48,14 +48,10 @@ static MIME_TO_EXT: &[(&str, &str)] = &[
 
 /// Get MIME type from file path extension.
 pub fn mime_from_path(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| format!(".{}", e.to_lowercase()));
-
-    if let Some(ext) = ext {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         for &(e, mime) in EXTENSION_MAP {
-            if e == ext {
+            // EXTENSION_MAP keys start with '.', skip it for comparison.
+            if e[1..].eq_ignore_ascii_case(ext) {
                 return mime;
             }
         }
