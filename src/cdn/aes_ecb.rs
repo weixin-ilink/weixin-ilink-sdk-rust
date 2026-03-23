@@ -1,5 +1,5 @@
 use aes::Aes128;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use ecb::{Decryptor, Encryptor};
 
 use crate::error::{Error, Result};
@@ -10,13 +10,13 @@ type Aes128EcbDec = Decryptor<Aes128>;
 /// Encrypt plaintext with AES-128-ECB (PKCS7 padding).
 pub fn encrypt_aes_ecb(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
     let enc = Aes128EcbEnc::new_from_slice(key).expect("invalid key length");
-    enc.encrypt_padded_vec_mut::<cipher::block_padding::Pkcs7>(plaintext)
+    enc.encrypt_padded_vec_mut::<Pkcs7>(plaintext)
 }
 
 /// Decrypt ciphertext with AES-128-ECB (PKCS7 padding).
 pub fn decrypt_aes_ecb(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
     let dec = Aes128EcbDec::new_from_slice(key).expect("invalid key length");
-    dec.decrypt_padded_vec_mut::<cipher::block_padding::Pkcs7>(ciphertext)
+    dec.decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
         .map_err(|e| Error::Aes(format!("AES-ECB decryption failed: {e}")))
 }
 

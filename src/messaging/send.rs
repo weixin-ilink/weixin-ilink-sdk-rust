@@ -68,7 +68,7 @@ fn image_message_item(uploaded: &UploadedFile) -> MessageItem {
         image_item: Some(ImageItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
-                aes_key: Some(BASE64.encode(&hex::decode(&uploaded.aeskey).unwrap_or_default())),
+                aes_key: Some(BASE64.encode(uploaded.aeskey.as_bytes())),
                 encrypt_type: Some(1),
             }),
             mid_size: Some(uploaded.ciphertext_size),
@@ -84,7 +84,7 @@ fn video_message_item(uploaded: &UploadedFile) -> MessageItem {
         video_item: Some(VideoItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
-                aes_key: Some(BASE64.encode(&hex::decode(&uploaded.aeskey).unwrap_or_default())),
+                aes_key: Some(BASE64.encode(uploaded.aeskey.as_bytes())),
                 encrypt_type: Some(1),
             }),
             video_size: Some(uploaded.ciphertext_size),
@@ -100,7 +100,7 @@ fn file_message_item(uploaded: &UploadedFile, file_name: &str) -> MessageItem {
         file_item: Some(FileItem {
             media: Some(CdnMedia {
                 encrypt_query_param: Some(uploaded.download_param.clone()),
-                aes_key: Some(BASE64.encode(&hex::decode(&uploaded.aeskey).unwrap_or_default())),
+                aes_key: Some(BASE64.encode(uploaded.aeskey.as_bytes())),
                 encrypt_type: Some(1),
             }),
             file_name: Some(file_name.to_string()),

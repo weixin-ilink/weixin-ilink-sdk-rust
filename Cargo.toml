@@ -19,7 +19,7 @@ rand = "0.10"
 md-5 = "0.10"
 aes = "0.8"
 ecb = { version = "0.1", features = ["alloc"] }
-cipher = { version = "0.4", features = ["block-padding"] }
+cipher = { version = "0.5", features = ["block-padding"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
